@@ -8,16 +8,99 @@ import streamlit.components.v1 as components
 import os
 import libsql_client as libsql
 
-def get_db_connection():
+# ใช้ Cache เพื่อไม่ให้สร้าง Connection ใหม่ทุกครั้งที่กล้องส่งข้อมูล
+@st.cache_resource
+def get_db_client():
     try:
         url = st.secrets["TURSO_URL"]
         token = st.secrets["TURSO_AUTH_TOKEN"]
-        # สร้าง client แบบ sync
-        client = libsql.create_client_sync(url=url, auth_token=token)
-        return client
+        # libsql_client ใช้ create_client_sync แทน connect
+        return libsql.create_client_sync(url=url, auth_token=token)
     except Exception as e:
         st.error(f"❌ ไม่สามารถเชื่อมต่อ Turso ได้: {e}")
         st.stop()
+
+def init_db():
+    client = get_db_client()
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS posture_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            duration_sec REAL NOT NULL,
+            max_theta REAL,
+            max_phi REAL,
+            min_neck_ratio_pct REAL,
+            cause TEXT,
+            alert_triggered INTEGER NOT NULL
+        )
+    """)
+
+try:
+    init_db()
+except Exception:
+    pass
+
+def register_user(username: str, password: str):
+    client = get_db_client()
+    res = client.execute("SELECT id FROM users WHERE username = ?", [username])
+    if len(res.rows) > 0:
+        return False, "มีชื่อผู้ใช้นี้ในระบบแล้ว"
+    
+    pw_hash, salt = hash_password(password)
+    client.execute(
+        "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+        [username, pw_hash, salt, datetime.now().isoformat()]
+    )
+    return True, "สมัครสมาชิกสำเร็จ กรุณาเข้าสู่ระบบ"
+
+def authenticate_user(username: str, password: str) -> bool:
+    client = get_db_client()
+    res = client.execute("SELECT password_hash, salt FROM users WHERE username = ?", [username])
+    if len(res.rows) == 0:
+        return False
+    row = res.rows[0]
+    return verify_password(password, row[1], row[0])
+
+def log_posture_event(username, duration_sec, max_theta, min_neck_ratio_pct, cause, alert_triggered):
+    end_time = datetime.now()
+    start_time = end_time - timedelta(seconds=duration_sec)
+    client = get_db_client()
+    client.execute(
+        "INSERT INTO posture_events "
+        "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
+        "min_neck_ratio_pct, cause, alert_triggered) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [username, start_time.isoformat(), end_time.isoformat(), duration_sec,
+         max_theta, None, min_neck_ratio_pct, cause, int(alert_triggered)]
+    )
+
+def get_user_events(username: str, since: datetime = None) -> pd.DataFrame:
+    client = get_db_client()
+    if since:
+        res = client.execute(
+            "SELECT * FROM posture_events WHERE username = ? AND start_time >= ? ORDER BY start_time DESC",
+            [username, since.isoformat()]
+        )
+    else:
+        res = client.execute(
+            "SELECT * FROM posture_events WHERE username = ? ORDER BY start_time DESC",
+            [username]
+        )
+    
+    # แปลงผลลัพธ์จาก libsql_client เป็น DataFrame
+    df = pd.DataFrame(res.rows, columns=res.columns)
+    return df
 
 # ==========================================
 # 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง
