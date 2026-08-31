@@ -6,7 +6,18 @@ import secrets
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 import os
-import libsql_experimental as libsql  # <-- ใช้ libsql สำหรับ Turso
+import libsql_client as libsql
+
+def get_db_connection():
+    try:
+        url = st.secrets["TURSO_URL"]
+        token = st.secrets["TURSO_AUTH_TOKEN"]
+        # สร้าง client แบบ sync
+        client = libsql.create_client_sync(url=url, auth_token=token)
+        return client
+    except Exception as e:
+        st.error(f"❌ ไม่สามารถเชื่อมต่อ Turso ได้: {e}")
+        st.stop()
 
 # ==========================================
 # 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง
