@@ -10,6 +10,7 @@ import os
 
 # ==========================================
 # 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง (Real-time)
+# แบบฝังระบบสื่อสารในตัว ไม่ต้องพึ่งพา CDN ภายนอก
 # ==========================================
 if not os.path.exists("ergo_frontend"):
     os.makedirs("ergo_frontend")
@@ -19,7 +20,6 @@ HTML_CONTENT = """
 <html>
 <head>
   <meta charset="UTF-8">
-  <script src="https://cdn.jsdelivr.net/npm/streamlit-component-lib@1.3.0/dist/streamlit.js"></script>
   <style> body { margin:0; padding:0; background: transparent; } </style>
 </head>
 <body>
@@ -33,8 +33,44 @@ HTML_CONTENT = """
       เปิดกล้อง
     </button>
   </div>
+
   <script type="module">
     import { PoseLandmarker, FilesetResolver } from "https://esm.sh/@mediapipe/tasks-vision@0.10.14";
+
+    // ----------------------------------------------------
+    // Streamlit Communication Bridge (ไม่ต้องใช้ CDN ภายนอก)
+    // ----------------------------------------------------
+    const Streamlit = {
+        setComponentReady: function() {
+            window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+        },
+        setFrameHeight: function(height) {
+            window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: height }, "*");
+        },
+        setComponentValue: function(value) {
+            window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: value }, "*");
+        }
+    };
+
+    let settings = { thetaThreshold: 5, slouchThresholdPct: 80, alertThresholdSec: 5, soundEnabled: true };
+    let lastCalibrationId = 0;
+    let pendingCalibration = false;
+
+    window.addEventListener("message", function(event) {
+        if (event.data && event.data.type === "streamlit:render") {
+            const args = event.data.args;
+            if (args.settings) settings = args.settings;
+            if (args.calibrationId && args.calibrationId !== lastCalibrationId) {
+                lastCalibrationId = args.calibrationId;
+                pendingCalibration = true;
+            }
+            Streamlit.setFrameHeight(450);
+        }
+    });
+
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(450);
+    // ----------------------------------------------------
 
     const video = document.getElementById('ergo-video');
     const canvas = document.getElementById('ergo-canvas');
@@ -45,36 +81,13 @@ HTML_CONTENT = """
     let poseLandmarker = null;
     let running = false;
     let lastVideoTime = -1;
-
     let calibratedNeckRatio = null;
-    let pendingCalibration = false;
-    let lastCalibrationId = 0;
-
-    let settings = { thetaThreshold: 5, slouchThresholdPct: 80, alertThresholdSec: 5, soundEnabled: true };
     let lastSentTime = 0;
 
     let badSince = null;
     let episodeMaxTheta = null, episodeMinNeckRatioPct = null;
     let alertFiredForEpisode = false;
     let episodeCauses = new Set();
-
-    function onRender(event) {
-      const args = event.detail.args;
-      if (args.settings) settings = args.settings;
-      if (args.calibrationId && args.calibrationId !== lastCalibrationId) {
-        lastCalibrationId = args.calibrationId;
-        pendingCalibration = true;
-      }
-      Streamlit.setFrameHeight(420);
-    }
-    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
-    Streamlit.setComponentReady();
-    Streamlit.setFrameHeight(420);
-
-    function sendToPython(payload) {
-      payload.timestamp = Date.now();
-      Streamlit.setComponentValue(payload);
-    }
 
     function playBeep() {
       try {
@@ -124,8 +137,10 @@ HTML_CONTENT = """
       if (!running) return;
       if (video.currentTime !== lastVideoTime && poseLandmarker) {
         lastVideoTime = video.currentTime;
-        const result = poseLandmarker.detectForVideo(video, performance.now());
-        processResult(result);
+        try {
+            const result = poseLandmarker.detectForVideo(video, performance.now());
+            processResult(result);
+        } catch (e) { console.error(e); }
       }
       requestAnimationFrame(renderLoop);
     }
@@ -144,7 +159,7 @@ HTML_CONTENT = """
       const lm = result.landmarks && result.landmarks[0];
       if (!lm) {
          if (Date.now() - lastSentTime > 1000) {
-             sendToPython({ theta: null, neckRatioPct: null, isBadPosture: false });
+             Streamlit.setComponentValue({ timestamp: Date.now(), theta: null, neckRatioPct: null, isBadPosture: false });
              lastSentTime = Date.now();
          }
          return;
@@ -179,7 +194,7 @@ HTML_CONTENT = """
 
       if (!hasShoulders) {
           if (Date.now() - lastSentTime > 1000) {
-             sendToPython({ theta: null, neckRatioPct: null, isBadPosture: false });
+             Streamlit.setComponentValue({ timestamp: Date.now(), theta: null, neckRatioPct: null, isBadPosture: false });
              lastSentTime = Date.now();
           }
           return;
@@ -241,7 +256,7 @@ HTML_CONTENT = """
          ctx.fillText('Good Posture', 10, 72);
          if (badSince) {
              const dur = (Date.now() - badSince) / 1000;
-             if (dur >= 1.0) {
+             if (dur >= 1.0) { // บันทึกเมื่อนั่งผิดท่าเกิน 1 วินาทีขึ้นไป
                  episodeEnded = true;
                  epDur = dur; epMaxT = episodeMaxTheta; epMinN = episodeMinNeckRatioPct;
                  epCauses = Array.from(episodeCauses); epAlert = alertFiredForEpisode;
@@ -251,9 +266,11 @@ HTML_CONTENT = """
          }
       }
 
+      // ส่งข้อมูลกลับไปหา Python ทุกๆ 1 วินาที หรือเมื่อจบ Event การนั่งผิดท่า
       if (episodeEnded || Date.now() - lastSentTime > 1000) {
           const payload = {
-              theta, neckRatioPct, isBadPosture: isBad,
+              timestamp: Date.now(),
+              theta: theta, neckRatioPct: neckRatioPct, isBadPosture: isBad,
               currentCauses: causes, isCalibrated: calibratedNeckRatio !== null,
               elapsedSec: badSince ? (Date.now() - badSince) / 1000 : 0
           };
@@ -262,7 +279,7 @@ HTML_CONTENT = """
               payload.maxTheta = epMaxT; payload.minNeckRatio = epMinN;
               payload.epCauses = epCauses; payload.alertTriggered = epAlert;
           }
-          sendToPython(payload);
+          Streamlit.setComponentValue(payload);
           lastSentTime = Date.now();
       }
     }
@@ -275,8 +292,8 @@ HTML_CONTENT = """
 with open("ergo_frontend/index.html", "w", encoding="utf-8") as f:
     f.write(HTML_CONTENT)
 
+# สร้าง Component
 ergo_camera_component = components.declare_component("ergo_camera_component", path="ergo_frontend")
-
 
 # ==========================================
 # 1. ฐานข้อมูล (ผู้ใช้ + สถิติการนั่ง)
@@ -402,7 +419,7 @@ def get_user_events(username: str, since: datetime = None) -> pd.DataFrame:
         conn.close()
 
 # ==========================================
-# 2. สาเหตุการนั่งผิดท่า (ตัด Torso ออก)
+# 2. สาเหตุการนั่งผิดท่า (ไม่มี Torso ตามที่ขอ)
 # ==========================================
 CAUSE_LABELS = {
     "shoulder_tilt": {"th": "ไหล่เอียง", "en": "Shoulder Tilt"},
@@ -479,7 +496,7 @@ with tab_camera:
     with calib_col2:
         st.caption("นั่งหลังตรง มองตรง แล้วกดปุ่มนี้หนึ่งครั้งเพื่อ Calibrate ระดับก้ม")
 
-    # เรียกใช้งาน Custom Component ส่งค่าไปและรับค่ากลับ
+    # เรียกใช้งาน Custom Component สื่อสารไป-กลับ
     component_data = ergo_camera_component(
         settings={
             "thetaThreshold": theta_slider,
@@ -495,12 +512,12 @@ with tab_camera:
     metrics_placeholder = st.empty()
 
     if component_data:
-        # ป้องกันการบันทึกซ้ำซ้อนจาก Event เดิม
+        # ป้องกันการประมวลผล Payload ซ้ำ
         ts = component_data.get("timestamp")
         if ts != st.session_state.last_timestamp:
             st.session_state.last_timestamp = ts
 
-            # บันทึกสถิติเมื่อได้รับสัญญาณตอนจบ Episode (เมื่อผู้ใช้กลับมานั่งตรง)
+            # ตรวจจับ Event การจบการนั่งผิดท่า (กลับมานั่งตรง) แล้วบันทึกลง DB
             if component_data.get("episodeEnded"):
                 log_posture_event(
                     st.session_state.logged_in_user,
@@ -512,7 +529,7 @@ with tab_camera:
                 )
                 st.toast("✅ บันทึกสถิติการนั่งผิดท่าสำเร็จ")
 
-    # แสดงผล UI ตัวเลขและแจ้งเตือน
+    # อ่านค่าตัวแปรเพื่อนำมาโชว์ใน Metrics UI
     if component_data:
         theta_val = component_data.get("theta")
         neck_val = component_data.get("neckRatioPct")
@@ -555,7 +572,7 @@ with tab_stats:
     df = get_user_events(st.session_state.logged_in_user, since=since_map[period])
 
     if df.empty:
-        st.info("ยังไม่มีข้อมูลสถิติในช่วงเวลานี้ (สถิติจะถูกบันทึกเมื่อคุณนั่งผิดท่าแล้วกลับมานั่งตรงอีกครั้ง)")
+        st.info("ยังไม่มีข้อมูลสถิติในช่วงเวลานี้ (สถิติจะถูกบันทึกเมื่อคุณนั่งผิดท่าอย่างน้อย 1 วินาที แล้วกลับมานั่งตรง)")
     else:
         df["start_time"] = pd.to_datetime(df["start_time"])
         total_bad_sec = df["duration_sec"].sum()
@@ -577,7 +594,7 @@ with tab_stats:
         display_df["max_theta"] = pd.to_numeric(display_df["max_theta"], errors="coerce").round(1)
         
         display_df["min_neck_ratio_pct"] = pd.to_numeric(display_df["min_neck_ratio_pct"], errors="coerce").round(0)
-        display_df["min_neck_ratio_pct"] = display_df["min_neck_ratio_pct"].apply(lambda v: f"{v:.0f}%" if pd.notna(v) else "N/A")
+        display_df["min_neck_ratio_pct"] = display_df["min_neck_ratio_pct"].apply(lambda v: f"{v:.0f}%" if pd.notna(v) else "—")
         
         display_df["cause"] = display_df["cause"].fillna("—")
         display_df["alert_triggered"] = display_df["alert_triggered"].map({1: "✅", 0: "—"})
