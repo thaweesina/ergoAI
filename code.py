@@ -8,102 +8,8 @@ import streamlit.components.v1 as components
 import os
 import libsql_client as libsql
 
-# ใช้ Cache เพื่อไม่ให้สร้าง Connection ใหม่ทุกครั้งที่กล้องส่งข้อมูล
-@st.cache_resource
-def get_db_client():
-    try:
-        url = st.secrets["TURSO_URL"]
-        token = st.secrets["TURSO_AUTH_TOKEN"]
-        # libsql_client ใช้ create_client_sync แทน connect
-        return libsql.create_client_sync(url=url, auth_token=token)
-    except Exception as e:
-        st.error(f"❌ ไม่สามารถเชื่อมต่อ Turso ได้: {e}")
-        st.stop()
-
-def init_db():
-    client = get_db_client()
-    client.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    client.execute("""
-        CREATE TABLE IF NOT EXISTS posture_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT NOT NULL,
-            duration_sec REAL NOT NULL,
-            max_theta REAL,
-            max_phi REAL,
-            min_neck_ratio_pct REAL,
-            cause TEXT,
-            alert_triggered INTEGER NOT NULL
-        )
-    """)
-
-try:
-    init_db()
-except Exception:
-    pass
-
-def register_user(username: str, password: str):
-    client = get_db_client()
-    res = client.execute("SELECT id FROM users WHERE username = ?", [username])
-    if len(res.rows) > 0:
-        return False, "มีชื่อผู้ใช้นี้ในระบบแล้ว"
-    
-    pw_hash, salt = hash_password(password)
-    client.execute(
-        "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-        [username, pw_hash, salt, datetime.now().isoformat()]
-    )
-    return True, "สมัครสมาชิกสำเร็จ กรุณาเข้าสู่ระบบ"
-
-def authenticate_user(username: str, password: str) -> bool:
-    client = get_db_client()
-    res = client.execute("SELECT password_hash, salt FROM users WHERE username = ?", [username])
-    if len(res.rows) == 0:
-        return False
-    row = res.rows[0]
-    return verify_password(password, row[1], row[0])
-
-def log_posture_event(username, duration_sec, max_theta, min_neck_ratio_pct, cause, alert_triggered):
-    end_time = datetime.now()
-    start_time = end_time - timedelta(seconds=duration_sec)
-    client = get_db_client()
-    client.execute(
-        "INSERT INTO posture_events "
-        "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
-        "min_neck_ratio_pct, cause, alert_triggered) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [username, start_time.isoformat(), end_time.isoformat(), duration_sec,
-         max_theta, None, min_neck_ratio_pct, cause, int(alert_triggered)]
-    )
-
-def get_user_events(username: str, since: datetime = None) -> pd.DataFrame:
-    client = get_db_client()
-    if since:
-        res = client.execute(
-            "SELECT * FROM posture_events WHERE username = ? AND start_time >= ? ORDER BY start_time DESC",
-            [username, since.isoformat()]
-        )
-    else:
-        res = client.execute(
-            "SELECT * FROM posture_events WHERE username = ? ORDER BY start_time DESC",
-            [username]
-        )
-    
-    # แปลงผลลัพธ์จาก libsql_client เป็น DataFrame
-    df = pd.DataFrame(res.rows, columns=res.columns)
-    return df
-
 # ==========================================
-# 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง
+# 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อกล้องและ AI
 # ==========================================
 if not os.path.exists("ergo_frontend"):
     os.makedirs("ergo_frontend")
@@ -381,21 +287,21 @@ with open("ergo_frontend/index.html", "w", encoding="utf-8") as f:
 ergo_camera_component = components.declare_component("ergo_camera_component", path="ergo_frontend")
 
 # ==========================================
-# 1. ฐานข้อมูล (Turso Cloud SQLite)
+# 1. จัดการ Turso Cloud Database (libsql-client)
 # ==========================================
-def get_db_connection():
+@st.cache_resource
+def get_db_client():
     try:
         url = st.secrets["TURSO_URL"]
         token = st.secrets["TURSO_AUTH_TOKEN"]
-        conn = libsql.connect(url, auth_token=token)
-        return conn
+        return libsql.create_client_sync(url=url, auth_token=token)
     except Exception as e:
-        st.error(f"ไม่สามารถเชื่อมต่อ Turso Database ได้: {e}")
+        st.error(f"❌ ไม่สามารถเชื่อมต่อ Turso Database ได้: {e}")
         st.stop()
 
 def init_db():
-    conn = get_db_connection()
-    conn.execute("""
+    client = get_db_client()
+    client.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -404,7 +310,7 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
+    client.execute("""
         CREATE TABLE IF NOT EXISTS posture_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL,
@@ -418,8 +324,6 @@ def init_db():
             alert_triggered INTEGER NOT NULL
         )
     """)
-    conn.commit()
-    conn.close()
 
 try:
     init_db()
@@ -437,76 +341,57 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
     return secrets.compare_digest(pw_hash, expected_hash)
 
 def register_user(username: str, password: str):
-    conn = get_db_connection()
-    try:
-        existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
-        if existing:
-            return False, "มีชื่อผู้ใช้นี้ในระบบแล้ว"
-        
-        pw_hash, salt = hash_password(password)
-        conn.execute(
-            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-            (username, pw_hash, salt, datetime.now().isoformat()),
-        )
-        conn.commit()
-        return True, "สมัครสมาชิกสำเร็จ กรุณาเข้าสู่ระบบ"
-    finally:
-        conn.close()
+    client = get_db_client()
+    res = client.execute("SELECT id FROM users WHERE username = ?", [username])
+    if len(res.rows) > 0:
+        return False, "มีชื่อผู้ใช้นี้ในระบบแล้ว"
+    
+    pw_hash, salt = hash_password(password)
+    client.execute(
+        "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+        [username, pw_hash, salt, datetime.now().isoformat()]
+    )
+    return True, "สมัครสมาชิกสำเร็จ กรุณาเข้าสู่ระบบ"
 
 def authenticate_user(username: str, password: str) -> bool:
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            "SELECT password_hash, salt FROM users WHERE username = ?", (username,)
-        ).fetchone()
-        if not row:
-            return False
-        expected_hash, salt = row
-        return verify_password(password, salt, expected_hash)
-    finally:
-        conn.close()
+    client = get_db_client()
+    res = client.execute("SELECT password_hash, salt FROM users WHERE username = ?", [username])
+    if len(res.rows) == 0:
+        return False
+    row = res.rows[0]
+    return verify_password(password, str(row[1]), str(row[0]))
 
 def log_posture_event(username, duration_sec, max_theta, min_neck_ratio_pct, cause, alert_triggered):
     end_time = datetime.now()
     start_time = end_time - timedelta(seconds=duration_sec)
-    
-    conn = get_db_connection()
-    try:
-        conn.execute(
-            "INSERT INTO posture_events "
-            "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
-            "min_neck_ratio_pct, cause, alert_triggered) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (username, start_time.isoformat(), end_time.isoformat(), duration_sec,
-             max_theta, None, min_neck_ratio_pct, cause, int(alert_triggered)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    client = get_db_client()
+    client.execute(
+        "INSERT INTO posture_events "
+        "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
+        "min_neck_ratio_pct, cause, alert_triggered) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [username, start_time.isoformat(), end_time.isoformat(), duration_sec,
+         max_theta, None, min_neck_ratio_pct, cause, int(alert_triggered)]
+    )
 
 def get_user_events(username: str, since: datetime = None) -> pd.DataFrame:
-    conn = get_db_connection()
-    try:
-        if since:
-            res = conn.execute(
-                "SELECT * FROM posture_events WHERE username = ? AND start_time >= ? ORDER BY start_time DESC",
-                (username, since.isoformat())
-            )
-        else:
-            res = conn.execute(
-                "SELECT * FROM posture_events WHERE username = ? ORDER BY start_time DESC",
-                (username,)
-            )
-        
-        rows = res.fetchall()
-        columns = [column[0] for column in res.description]
-        df = pd.DataFrame(rows, columns=columns)
-        return df
-    finally:
-        conn.close()
+    client = get_db_client()
+    if since:
+        res = client.execute(
+            "SELECT * FROM posture_events WHERE username = ? AND start_time >= ? ORDER BY start_time DESC",
+            [username, since.isoformat()]
+        )
+    else:
+        res = client.execute(
+            "SELECT * FROM posture_events WHERE username = ? ORDER BY start_time DESC",
+            [username]
+        )
+    
+    df = pd.DataFrame(res.rows, columns=res.columns)
+    return df
 
 # ==========================================
-# 2. สาเหตุการนั่งผิดท่า
+# 2. แปลงข้อความสาเหตุการนั่งผิดท่า
 # ==========================================
 CAUSE_LABELS = {
     "shoulder_tilt": {"th": "ไหล่เอียง", "en": "Shoulder Tilt"},
@@ -517,7 +402,7 @@ def causes_to_text(cause_keys, lang="th"):
     return ", ".join(CAUSE_LABELS[c][lang] for c in cause_keys if c in CAUSE_LABELS)
 
 # ==========================================
-# 3. หน้า Login / UI หลัก
+# 3. ส่วนแสดงผล UI (Streamlit)
 # ==========================================
 st.set_page_config(page_title="Ergo-Vision AI", layout="wide")
 
@@ -528,6 +413,7 @@ if "calibration_id" not in st.session_state:
 if "last_timestamp" not in st.session_state:
     st.session_state.last_timestamp = 0
 
+# หน้าแสดงผล Login / Register
 if not st.session_state.logged_in_user:
     st.title("🪑 Ergo-Vision AI")
     st.caption("เข้าสู่ระบบเพื่อบันทึกสถิติการนั่งของคุณ")
@@ -560,6 +446,7 @@ if not st.session_state.logged_in_user:
                         st.error(msg)
     st.stop()
 
+# หน้าแอปพลิเคชันหลักเมื่อ Login แล้ว
 st.title("🪑 Ergo-Vision AI: แจ้งเตือนท่านั่ง Real-time")
 
 st.sidebar.markdown(f"👤 เข้าสู่ระบบในชื่อ: **{st.session_state.logged_in_user}**")
