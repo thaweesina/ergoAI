@@ -1,5 +1,4 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import json
 import hashlib
@@ -7,14 +6,15 @@ import secrets
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 import os
+import psycopg2 # <-- เปลี่ยนมาใช้ psycopg2
 
 # ==========================================
-# 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง (Real-time)
-# แบบฝังระบบสื่อสารในตัว ไม่ต้องพึ่งพา CDN ภายนอก
+# 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง
 # ==========================================
 if not os.path.exists("ergo_frontend"):
     os.makedirs("ergo_frontend")
 
+# (โค้ด HTML_CONTENT เป็นตัวเดิม 100% ไม่เปลี่ยนแปลง)
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
@@ -37,9 +37,6 @@ HTML_CONTENT = """
   <script type="module">
     import { PoseLandmarker, FilesetResolver } from "https://esm.sh/@mediapipe/tasks-vision@0.10.14";
 
-    // ----------------------------------------------------
-    // Streamlit Communication Bridge (ไม่ต้องใช้ CDN ภายนอก)
-    // ----------------------------------------------------
     const Streamlit = {
         setComponentReady: function() {
             window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
@@ -70,7 +67,6 @@ HTML_CONTENT = """
 
     Streamlit.setComponentReady();
     Streamlit.setFrameHeight(450);
-    // ----------------------------------------------------
 
     const video = document.getElementById('ergo-video');
     const canvas = document.getElementById('ergo-canvas');
@@ -115,9 +111,7 @@ HTML_CONTENT = """
         });
         statusEl.textContent = 'พร้อมใช้งานแล้ว กดปุ่ม "เปิดกล้อง"';
         startBtn.disabled = false;
-      } catch (e) {
-        statusEl.textContent = 'Error: ' + e.message;
-      }
+      } catch (e) { statusEl.textContent = 'Error: ' + e.message; }
     }
 
     startBtn.addEventListener('click', async () => {
@@ -256,7 +250,7 @@ HTML_CONTENT = """
          ctx.fillText('Good Posture', 10, 72);
          if (badSince) {
              const dur = (Date.now() - badSince) / 1000;
-             if (dur >= 1.0) { // บันทึกเมื่อนั่งผิดท่าเกิน 1 วินาทีขึ้นไป
+             if (dur >= 1.0) {
                  episodeEnded = true;
                  epDur = dur; epMaxT = episodeMaxTheta; epMinN = episodeMinNeckRatioPct;
                  epCauses = Array.from(episodeCauses); epAlert = alertFiredForEpisode;
@@ -266,7 +260,6 @@ HTML_CONTENT = """
          }
       }
 
-      // ส่งข้อมูลกลับไปหา Python ทุกๆ 1 วินาที หรือเมื่อจบ Event การนั่งผิดท่า
       if (episodeEnded || Date.now() - lastSentTime > 1000) {
           const payload = {
               timestamp: Date.now(),
@@ -292,33 +285,35 @@ HTML_CONTENT = """
 with open("ergo_frontend/index.html", "w", encoding="utf-8") as f:
     f.write(HTML_CONTENT)
 
-# สร้าง Component
 ergo_camera_component = components.declare_component("ergo_camera_component", path="ergo_frontend")
 
 # ==========================================
-# 1. ฐานข้อมูล (ผู้ใช้ + สถิติการนั่ง)
+# 1. ฐานข้อมูล (PostgreSQL / Supabase)
 # ==========================================
-DB_PATH = "ergovision.db"
-
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+    try:
+        conn = psycopg2.connect(st.secrets["DATABASE_URL"])
+        return conn
+    except Exception as e:
+        st.error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้ โปรดตรวจสอบ DATABASE_URL ใน Secrets")
+        st.stop()
 
 def init_db():
     conn = get_db_connection()
-    conn.execute("""
+    cur = conn.cursor()
+    # PostgreSQL ใช้ SERIAL แทน AUTOINCREMENT
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS posture_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT NOT NULL,
             start_time TEXT NOT NULL,
             end_time TEXT NOT NULL,
@@ -330,18 +325,15 @@ def init_db():
             alert_triggered INTEGER NOT NULL
         )
     """)
-    for ddl in (
-        "ALTER TABLE posture_events ADD COLUMN min_neck_ratio_pct REAL",
-        "ALTER TABLE posture_events ADD COLUMN cause TEXT",
-    ):
-        try:
-            conn.execute(ddl)
-        except sqlite3.OperationalError:
-            pass
     conn.commit()
+    cur.close()
     conn.close()
 
-init_db()
+# เรียกใช้งานครั้งแรกเพื่อสร้างตาราง
+try:
+    init_db()
+except Exception as e:
+    pass # ข้ามไปถ้าระบบโหลดซ้ำ
 
 def hash_password(password: str, salt: str = None):
     if salt is None:
@@ -355,71 +347,87 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 
 def register_user(username: str, password: str):
     conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        # PostgreSQL ใช้ %s แทน ?
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+        existing = cur.fetchone()
         if existing:
             return False, "มีชื่อผู้ใช้นี้ในระบบแล้ว"
+        
         pw_hash, salt = hash_password(password)
-        conn.execute(
-            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+        cur.execute(
+            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s)",
             (username, pw_hash, salt, datetime.now().isoformat()),
         )
         conn.commit()
         return True, "สมัครสมาชิกสำเร็จ กรุณาเข้าสู่ระบบ"
     finally:
+        cur.close()
         conn.close()
 
 def authenticate_user(username: str, password: str) -> bool:
     conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        row = conn.execute(
-            "SELECT password_hash, salt FROM users WHERE username = ?", (username,)
-        ).fetchone()
+        cur.execute(
+            "SELECT password_hash, salt FROM users WHERE username = %s", (username,)
+        )
+        row = cur.fetchone()
         if not row:
             return False
         expected_hash, salt = row
         return verify_password(password, salt, expected_hash)
     finally:
+        cur.close()
         conn.close()
 
 def log_posture_event(username, duration_sec, max_theta, min_neck_ratio_pct, cause, alert_triggered):
-    # คำนวณเวลาย้อนหลังตามระยะเวลาที่นั่งผิดท่า
     end_time = datetime.now()
     start_time = end_time - timedelta(seconds=duration_sec)
     
     conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        conn.execute(
+        cur.execute(
             "INSERT INTO posture_events "
             "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
             "min_neck_ratio_pct, cause, alert_triggered) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (username, start_time.isoformat(), end_time.isoformat(), duration_sec,
              max_theta, None, min_neck_ratio_pct, cause, int(alert_triggered)),
         )
         conn.commit()
     finally:
+        cur.close()
         conn.close()
 
 def get_user_events(username: str, since: datetime = None) -> pd.DataFrame:
     conn = get_db_connection()
+    cur = conn.cursor()
     try:
         if since:
-            df = pd.read_sql_query(
-                "SELECT * FROM posture_events WHERE username = ? AND start_time >= ? ORDER BY start_time DESC",
-                conn, params=(username, since.isoformat()),
+            cur.execute(
+                "SELECT * FROM posture_events WHERE username = %s AND start_time >= %s ORDER BY start_time DESC",
+                (username, since.isoformat())
             )
         else:
-            df = pd.read_sql_query(
-                "SELECT * FROM posture_events WHERE username = ? ORDER BY start_time DESC",
-                conn, params=(username,),
+            cur.execute(
+                "SELECT * FROM posture_events WHERE username = %s ORDER BY start_time DESC",
+                (username,)
             )
+        
+        rows = cur.fetchall()
+        # นำชื่อคอลัมน์ออกมาสร้างเป็น DataFrame
+        colnames = [desc[0] for desc in cur.description]
+        df = pd.DataFrame(rows, columns=colnames)
         return df
     finally:
+        cur.close()
         conn.close()
 
 # ==========================================
-# 2. สาเหตุการนั่งผิดท่า (ไม่มี Torso ตามที่ขอ)
+# 2. สาเหตุการนั่งผิดท่า
 # ==========================================
 CAUSE_LABELS = {
     "shoulder_tilt": {"th": "ไหล่เอียง", "en": "Shoulder Tilt"},
@@ -496,7 +504,6 @@ with tab_camera:
     with calib_col2:
         st.caption("นั่งหลังตรง มองตรง แล้วกดปุ่มนี้หนึ่งครั้งเพื่อ Calibrate ระดับก้ม")
 
-    # เรียกใช้งาน Custom Component สื่อสารไป-กลับ
     component_data = ergo_camera_component(
         settings={
             "thetaThreshold": theta_slider,
@@ -512,12 +519,10 @@ with tab_camera:
     metrics_placeholder = st.empty()
 
     if component_data:
-        # ป้องกันการประมวลผล Payload ซ้ำ
         ts = component_data.get("timestamp")
         if ts != st.session_state.last_timestamp:
             st.session_state.last_timestamp = ts
 
-            # ตรวจจับ Event การจบการนั่งผิดท่า (กลับมานั่งตรง) แล้วบันทึกลง DB
             if component_data.get("episodeEnded"):
                 log_posture_event(
                     st.session_state.logged_in_user,
@@ -527,9 +532,8 @@ with tab_camera:
                     causes_to_text(component_data.get("epCauses", []), lang="th"),
                     component_data.get("alertTriggered", False)
                 )
-                st.toast("✅ บันทึกสถิติการนั่งผิดท่าสำเร็จ")
+                st.toast("✅ บันทึกสถิติการนั่งผิดท่าลงฐานข้อมูลสำเร็จ")
 
-    # อ่านค่าตัวแปรเพื่อนำมาโชว์ใน Metrics UI
     if component_data:
         theta_val = component_data.get("theta")
         neck_val = component_data.get("neckRatioPct")
