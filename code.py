@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 import os
-import psycopg2 # <-- เปลี่ยนมาใช้ psycopg2
+import libsql_experimental as libsql  # <-- ใช้ libsql สำหรับ Turso
 
 # ==========================================
 # 0. สร้างไฟล์ Frontend สำหรับเชื่อมต่อข้อมูล 2 ทาง
@@ -14,7 +14,6 @@ import psycopg2 # <-- เปลี่ยนมาใช้ psycopg2
 if not os.path.exists("ergo_frontend"):
     os.makedirs("ergo_frontend")
 
-# (โค้ด HTML_CONTENT เป็นตัวเดิม 100% ไม่เปลี่ยนแปลง)
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html>
@@ -288,32 +287,32 @@ with open("ergo_frontend/index.html", "w", encoding="utf-8") as f:
 ergo_camera_component = components.declare_component("ergo_camera_component", path="ergo_frontend")
 
 # ==========================================
-# 1. ฐานข้อมูล (PostgreSQL / Supabase)
+# 1. ฐานข้อมูล (Turso Cloud SQLite)
 # ==========================================
 def get_db_connection():
     try:
-        conn = psycopg2.connect(st.secrets["DATABASE_URL"])
+        url = st.secrets["TURSO_URL"]
+        token = st.secrets["TURSO_AUTH_TOKEN"]
+        conn = libsql.connect(url, auth_token=token)
         return conn
     except Exception as e:
-        st.error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้ โปรดตรวจสอบ DATABASE_URL ใน Secrets")
+        st.error(f"ไม่สามารถเชื่อมต่อ Turso Database ได้: {e}")
         st.stop()
 
 def init_db():
     conn = get_db_connection()
-    cur = conn.cursor()
-    # PostgreSQL ใช้ SERIAL แทน AUTOINCREMENT
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS posture_events (
-            id SERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL,
             start_time TEXT NOT NULL,
             end_time TEXT NOT NULL,
@@ -326,14 +325,12 @@ def init_db():
         )
     """)
     conn.commit()
-    cur.close()
     conn.close()
 
-# เรียกใช้งานครั้งแรกเพื่อสร้างตาราง
 try:
     init_db()
-except Exception as e:
-    pass # ข้ามไปถ้าระบบโหลดซ้ำ
+except Exception:
+    pass
 
 def hash_password(password: str, salt: str = None):
     if salt is None:
@@ -347,39 +344,32 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 
 def register_user(username: str, password: str):
     conn = get_db_connection()
-    cur = conn.cursor()
     try:
-        # PostgreSQL ใช้ %s แทน ?
-        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
-        existing = cur.fetchone()
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
         if existing:
             return False, "มีชื่อผู้ใช้นี้ในระบบแล้ว"
         
         pw_hash, salt = hash_password(password)
-        cur.execute(
-            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (%s, %s, %s, %s)",
+        conn.execute(
+            "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
             (username, pw_hash, salt, datetime.now().isoformat()),
         )
         conn.commit()
         return True, "สมัครสมาชิกสำเร็จ กรุณาเข้าสู่ระบบ"
     finally:
-        cur.close()
         conn.close()
 
 def authenticate_user(username: str, password: str) -> bool:
     conn = get_db_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            "SELECT password_hash, salt FROM users WHERE username = %s", (username,)
-        )
-        row = cur.fetchone()
+        row = conn.execute(
+            "SELECT password_hash, salt FROM users WHERE username = ?", (username,)
+        ).fetchone()
         if not row:
             return False
         expected_hash, salt = row
         return verify_password(password, salt, expected_hash)
     finally:
-        cur.close()
         conn.close()
 
 def log_posture_event(username, duration_sec, max_theta, min_neck_ratio_pct, cause, alert_triggered):
@@ -387,43 +377,38 @@ def log_posture_event(username, duration_sec, max_theta, min_neck_ratio_pct, cau
     start_time = end_time - timedelta(seconds=duration_sec)
     
     conn = get_db_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
+        conn.execute(
             "INSERT INTO posture_events "
             "(username, start_time, end_time, duration_sec, max_theta, max_phi, "
             "min_neck_ratio_pct, cause, alert_triggered) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (username, start_time.isoformat(), end_time.isoformat(), duration_sec,
              max_theta, None, min_neck_ratio_pct, cause, int(alert_triggered)),
         )
         conn.commit()
     finally:
-        cur.close()
         conn.close()
 
 def get_user_events(username: str, since: datetime = None) -> pd.DataFrame:
     conn = get_db_connection()
-    cur = conn.cursor()
     try:
         if since:
-            cur.execute(
-                "SELECT * FROM posture_events WHERE username = %s AND start_time >= %s ORDER BY start_time DESC",
+            res = conn.execute(
+                "SELECT * FROM posture_events WHERE username = ? AND start_time >= ? ORDER BY start_time DESC",
                 (username, since.isoformat())
             )
         else:
-            cur.execute(
-                "SELECT * FROM posture_events WHERE username = %s ORDER BY start_time DESC",
+            res = conn.execute(
+                "SELECT * FROM posture_events WHERE username = ? ORDER BY start_time DESC",
                 (username,)
             )
         
-        rows = cur.fetchall()
-        # นำชื่อคอลัมน์ออกมาสร้างเป็น DataFrame
-        colnames = [desc[0] for desc in cur.description]
-        df = pd.DataFrame(rows, columns=colnames)
+        rows = res.fetchall()
+        columns = [column[0] for column in res.description]
+        df = pd.DataFrame(rows, columns=columns)
         return df
     finally:
-        cur.close()
         conn.close()
 
 # ==========================================
@@ -532,7 +517,7 @@ with tab_camera:
                     causes_to_text(component_data.get("epCauses", []), lang="th"),
                     component_data.get("alertTriggered", False)
                 )
-                st.toast("✅ บันทึกสถิติการนั่งผิดท่าลงฐานข้อมูลสำเร็จ")
+                st.toast("✅ บันทึกสถิติลง Turso Cloud Database สำเร็จ")
 
     if component_data:
         theta_val = component_data.get("theta")
